@@ -488,7 +488,11 @@ class TaskSequenceManager(Node):
         req.message = recording_id
         future = self.start_recording_client.call_async(req)
 
-        if not self.wait_for_trigger_future_done(future, error_situation="Start recording service call failed"):
+        # Include metadata initialization and the recorder's bounded readiness
+        # check; timing out first could leave a live bag outside the task state.
+        if not self.wait_for_trigger_future_done(
+            future, timeout=30.0, error_situation="Start recording service call failed",
+        ):
             return False, "record_manager service call failed"
         return True, ""
 

@@ -22,6 +22,7 @@ from std_srvs.srv import Trigger
 from airoa_data_msgs.srv import StringTrigger
 
 from yubi_core.backend_client import create_backend
+from yubi_core.recording_process import start_recorder, stop_failed_recorder
 
 STResponse = StringTrigger.Response
 STRequest = StringTrigger.Request
@@ -32,6 +33,7 @@ class RecordManager(Node):
         super().__init__("record_manager")
         self.rosbag_process: Optional[subprocess.Popen] = None
         self.is_recording = False
+        self._recording_lock = threading.RLock()
         self.recent_record_dir: Optional[str] = None
         self.task_name: Optional[str] = None
         self.reent_cg = ReentrantCallbackGroup()
@@ -188,6 +190,12 @@ class RecordManager(Node):
         latched_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
 
         self.rosbag_manager_mode_pub = self.create_publisher(Bool, "~/recording", latched_qos)
+        # One ordered stream carries confirmed lifecycle outcomes. A Bool cannot
+        # distinguish a saved episode from a cancellation or recorder failure.
+        self.recording_feedback_pub = self.create_publisher(
+            String, "~/recording_feedback", latched_qos
+        )
+        self._publish_recording_feedback("idle")
         self.storage_free_space_pub = self.create_publisher(Int64, "~/free", 10)
         self.storage_used_space_pub = self.create_publisher(Int64, "~/used", 10)
 
@@ -260,9 +268,34 @@ class RecordManager(Node):
         self.storage_used_space_pub.publish(used_msg)
 
     def publish_recording_state(self):
-        msg = Bool()
-        msg.data = self.is_recording
-        self.rosbag_manager_mode_pub.publish(msg)
+        # A timer must not occupy an executor thread waiting for a service
+        # callback that itself needs executor threads for metadata responses.
+        if not self._recording_lock.acquire(blocking=False):
+            return
+        try:
+            if self.is_recording and self.rosbag_process is not None:
+                result = self.rosbag_process.poll()
+                if result is not None:
+                    self.is_recording = False
+                    self.rosbag_process = None
+                    self.get_logger().error(
+                        f"Rosbag recorder exited unexpectedly (status {result}); "
+                        "recording stopped, data has not been verified or uploaded."
+                    )
+                    self._publish_recording_feedback("failed")
+            msg = Bool()
+            msg.data = self.is_recording
+            self.rosbag_manager_mode_pub.publish(msg)
+        finally:
+            self._recording_lock.release()
+
+    def _publish_recording_feedback(self, state):
+        message = String()
+        message.data = json.dumps({
+            "state": state,
+            "recording_id": self.task_name or "",
+        })
+        self.recording_feedback_pub.publish(message)
 
     def wait_for_future_done(self, future: rclpy.Future, timeout: float = 1.0, sleep_time: float = 0.01):
         elapsed = 0.0
@@ -271,6 +304,10 @@ class RecordManager(Node):
             elapsed += sleep_time
 
     def start_recording(self, message: Optional[str]) -> Tuple[bool, str]:
+        with self._recording_lock:
+            return self._start_recording(message)
+
+    def _start_recording(self, message: Optional[str]) -> Tuple[bool, str]:
         task_name = message or datetime.now(timezone.utc).strftime("rosbag-%Y%m%d-%H%M%S")
         total, used, free = shutil.disk_usage(self.record_base_dir)
         self.get_logger().info(f"Free space: {free}, Required: {self.required_free_space}")
@@ -415,6 +452,12 @@ class RecordManager(Node):
                     "use_sim_time requested but /clock not available — using wall clock"
                 )
         command.extend(self.rosbag_params)
+        # Keep the readiness marker and recorder identity deterministic. Pausing
+        # is not part of this button-driven recording workflow.
+        command.extend([
+            "--node-name", "rosbag2_recorder", "--log-level", "info",
+            "--disable-keyboard-controls",
+        ])
         if self.qos_overrides_file:
             command.extend(["--qos-profile-overrides-path", self.qos_overrides_file])
         command.extend(self.record_topics)
@@ -422,10 +465,20 @@ class RecordManager(Node):
         self.get_logger().info(f"Recording command: {' '.join(command)}")
 
         try:
-            self.rosbag_process = subprocess.Popen(command)
-        except FileNotFoundError as exc:
+            self.rosbag_process, ready = start_recorder(command)
+        except OSError as exc:
             self.get_logger().error(f"Failed to start rosbag2: {exc}")
-            return False, "ros2 bag command not found"
+            return False, f"Failed to launch rosbag2: {exc}"
+
+        if not ready:
+            stop_failed_recorder(self.rosbag_process)
+            self.rosbag_process = None
+            self.get_logger().error(
+                "Rosbag did not enter recording within 10 seconds; "
+                f"startup aborted. Check recorder output and {record_dir}."
+            )
+            self.publish_recording_state()
+            return False, "Rosbag failed to enter recording"
 
         # Successfully started recording
         self.is_recording = True
@@ -434,10 +487,17 @@ class RecordManager(Node):
         self.recent_record_dir = record_dir
 
         self.publish_recording_state()
+        if not self.is_recording:
+            return False, "Rosbag exited immediately after startup"
+        self._publish_recording_feedback("recording")
         self.get_logger().info("Rosbag recording started.")
         return True, "Success"
 
     def stop_recording(self) -> Tuple[bool, str]:
+        with self._recording_lock:
+            return self._stop_recording()
+
+    def _stop_recording(self) -> Tuple[bool, str]:
         if not self.is_recording or self.rosbag_process is None:
             self.get_logger().warn("Rosbag is not recording.")
             return False, "Rosbag is not recording."
@@ -452,20 +512,27 @@ class RecordManager(Node):
         self.rosbag_process.wait()
         self.rosbag_process = None
         self.is_recording = False
+        self.publish_recording_state()
 
         if get_verified_metadata_future.result() is None or not get_verified_metadata_future.result().success:
             self.get_logger().error("Metadata verification failed. Remove the recording.")
             self.delete_last_recording()
-
+            self._publish_recording_feedback("failed")
             return False, "Metadata verification failed. Recording removed."
 
-        meta_dict = json.loads(get_verified_metadata_future.result().message)
-        self.save_meta_file(meta_dict)
+        try:
+            meta_dict = json.loads(get_verified_metadata_future.result().message)
+            self.save_meta_file(meta_dict)
+        except (ValueError, OSError) as exc:
+            self.get_logger().error(f"Failed to save recording metadata: {exc}")
+            self._publish_recording_feedback("failed")
+            return False, f"Failed to save recording metadata: {exc}"
 
         # Notify uploader of completed recording
         completed_msg = String()
         completed_msg.data = self.recent_record_dir
         self.recording_completed_pub.publish(completed_msg)
+        self._publish_recording_feedback("completed")
 
         self.publish_recording_state()
         self.get_logger().info("Rosbag recording stopped.")
@@ -507,6 +574,10 @@ class RecordManager(Node):
         return response
 
     def cancel_recording(self) -> Tuple[bool, str]:
+        with self._recording_lock:
+            return self._cancel_recording()
+
+    def _cancel_recording(self) -> Tuple[bool, str]:
         """Stop recording without uploading, notify cancellation, and delete."""
         if not self.is_recording or self.rosbag_process is None:
             self.get_logger().warn("Rosbag is not recording.")
@@ -516,6 +587,7 @@ class RecordManager(Node):
         self.rosbag_process.wait()
         self.rosbag_process = None
         self.is_recording = False
+        self.publish_recording_state()
 
         # Notify storage node of cancellation (no upload)
         if self.recent_record_dir:
@@ -523,7 +595,10 @@ class RecordManager(Node):
             cancelled_msg.data = self.recent_record_dir
             self.recording_cancelled_pub.publish(cancelled_msg)
 
-        self.delete_last_recording()
+        if not self.delete_last_recording():
+            self._publish_recording_feedback("failed")
+            return False, "Recording stopped, but cancellation could not delete data"
+        self._publish_recording_feedback("cancelled")
         self.publish_recording_state()
         self.get_logger().info("Recording cancelled and deleted.")
         return True, "Recording cancelled"

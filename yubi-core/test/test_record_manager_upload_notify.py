@@ -4,6 +4,7 @@ All ROS2 dependencies are mocked via ``conftest.mock_rclpy``.
 """
 
 import json
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -43,6 +44,7 @@ def record_manager(mock_rclpy, tmp_record_dir):
     # Instance attributes that __init__ would set
     node.rosbag_process = None
     node.is_recording = False
+    node._recording_lock = threading.RLock()
     node.recent_record_dir = None
     node.task_name = None
     node.reent_cg = MagicMock()
@@ -61,6 +63,7 @@ def record_manager(mock_rclpy, tmp_record_dir):
     node.storage_free_space_pub = MagicMock()
     node.storage_used_space_pub = MagicMock()
     node.recording_completed_pub = MagicMock()
+    node.recording_feedback_pub = MagicMock()
 
     # Service clients
     node.init_meta_client = MagicMock()
@@ -104,6 +107,8 @@ class TestStopRecordingPublish:
         record_manager.recording_completed_pub.publish.assert_called_once()
         call_arg = record_manager.recording_completed_pub.publish.call_args[0][0]
         assert call_arg.data == str(rec_dir)
+        feedback = json.loads(record_manager.recording_feedback_pub.publish.call_args.args[0].data)
+        assert feedback["state"] == "completed"
 
     def test_no_publish_on_metadata_failure(self, record_manager, tmp_record_dir):
         rec_dir = tmp_record_dir / "task_002"
@@ -128,6 +133,8 @@ class TestStopRecordingPublish:
 
         assert success is False
         record_manager.recording_completed_pub.publish.assert_not_called()
+        assert record_manager.rosbag_manager_mode_pub.publish.call_args.args[0].data is False
+        assert json.loads(record_manager.recording_feedback_pub.publish.call_args.args[0].data)["state"] == "failed"
 
     def test_no_publish_when_not_recording(self, record_manager):
         record_manager.is_recording = False
@@ -137,3 +144,115 @@ class TestStopRecordingPublish:
 
         assert success is False
         record_manager.recording_completed_pub.publish.assert_not_called()
+
+
+def test_unexpected_exit_publishes_stopped_without_upload(record_manager):
+    record_manager.is_recording = True
+    record_manager.rosbag_process = MagicMock()
+    record_manager.rosbag_process.poll.return_value = 1
+    record_manager.publish_recording_state()
+    assert not record_manager.is_recording
+    assert record_manager.rosbag_process is None
+    assert record_manager.rosbag_manager_mode_pub.publish.call_args.args[0].data is False
+    record_manager.recording_completed_pub.publish.assert_not_called()
+    assert json.loads(record_manager.recording_feedback_pub.publish.call_args.args[0].data)["state"] == "failed"
+
+
+def test_live_process_keeps_recording_state(record_manager):
+    record_manager.is_recording = True
+    record_manager.rosbag_process = MagicMock()
+    record_manager.rosbag_process.poll.return_value = None
+    record_manager.publish_recording_state()
+    assert record_manager.rosbag_manager_mode_pub.publish.call_args.args[0].data is True
+
+
+@pytest.fixture
+def ready_manager(record_manager):
+    node = record_manager
+    for name, value in {
+        "robot_type": "yubi", "environment_type": "real_world",
+        "teleop_interface": "pico", "teleop_interface_url": "",
+        "teleop_interface_hash": "", "teleop_interface_branch": "",
+        "devices": "[]",
+    }.items():
+        node.declare_parameter(name, value)
+    node.use_sim_time = False
+    node.record_url = node.record_hash = node.record_branch = "test"
+    for name in ("set_robot_client", "set_environment_client",
+                 "extend_programs_client", "set_devices_client"):
+        setattr(node, name, MagicMock())
+    return node
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_start_status_requires_recorder_readiness(ready_manager, ready):
+    node = ready_manager
+    process = MagicMock()
+    process.poll.return_value = None
+
+    def start(command):
+        # A button/service request alone must never publish recording=true.
+        assert not node.is_recording
+        node.rosbag_manager_mode_pub.publish.assert_not_called()
+        assert "--disable-keyboard-controls" in command
+        return process, ready
+
+    with patch("yubi_core.record_manager.start_recorder", side_effect=start), \
+            patch("yubi_core.record_manager.stop_failed_recorder") as stop:
+        success, message = node.start_recording("voice-test")
+    assert success is ready
+    assert node.is_recording is ready
+    assert node.rosbag_manager_mode_pub.publish.call_args.args[0].data is ready
+    assert stop.call_count == (0 if ready else 1)
+    if ready:
+        assert json.loads(node.recording_feedback_pub.publish.call_args.args[0].data) == {
+            "state": "recording", "recording_id": "voice-test",
+        }
+    else:
+        node.recording_feedback_pub.publish.assert_not_called()
+
+
+def test_launch_exception_does_not_publish_active(ready_manager):
+    with patch("yubi_core.record_manager.start_recorder", side_effect=OSError("failed")):
+        success, _ = ready_manager.start_recording("voice-test")
+    assert not success
+    assert not ready_manager.is_recording
+    ready_manager.rosbag_manager_mode_pub.publish.assert_not_called()
+
+
+def test_stop_status_only_changes_after_process_exit(record_manager):
+    node = record_manager
+    node.is_recording = True
+    process = node.rosbag_process = MagicMock()
+    process.wait.side_effect = lambda: (
+        node.rosbag_manager_mode_pub.publish.assert_not_called()
+    )
+    node.get_verified_metadata_client.call_async.return_value.result.return_value = None
+    node.delete_last_recording = MagicMock()
+    success, _ = node.stop_recording()
+    assert not success  # Metadata failure still publishes the real stopped state.
+    process.wait.assert_called_once()
+    assert node.rosbag_manager_mode_pub.publish.call_args.args[0].data is False
+
+
+def test_cancel_publishes_stopped_without_upload(record_manager):
+    node = record_manager
+    node.is_recording = True
+    node.rosbag_process = MagicMock()
+    node.recording_cancelled_pub = MagicMock()
+    node.delete_last_recording = MagicMock()
+    success, _ = node.cancel_recording()
+    assert success
+    assert node.rosbag_manager_mode_pub.publish.call_args.args[0].data is False
+    node.recording_completed_pub.publish.assert_not_called()
+    assert json.loads(node.recording_feedback_pub.publish.call_args.args[0].data)["state"] == "cancelled"
+
+
+def test_cancellation_delete_failure_does_not_announce_cancelled(record_manager):
+    node = record_manager
+    node.is_recording = True
+    node.rosbag_process = MagicMock()
+    node.delete_last_recording = MagicMock(return_value=False)
+    success, _ = node.cancel_recording()
+    assert not success
+    assert json.loads(node.recording_feedback_pub.publish.call_args.args[0].data)["state"] == "failed"
